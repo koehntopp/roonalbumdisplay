@@ -258,11 +258,66 @@ SDK. It's what Home Assistant's own Roon integration is built on.
   persists `roon_core_id.txt` + `roon_token.txt` next to the script
   (gitignored). Needs to actually run and wait — see the background-task
   pitfall below for how *not* to launch it.
-- **`roon_to_matrix.py`** — the daemon. Loads saved credentials,
-  rediscovers the core's current `host:port` via
-  `RoonDiscovery(core_id).first()` (handles the Core's IP changing),
-  connects with `blocking_init=True`, and registers a state callback on
+- **`roon_to_matrix.py`** — the daemon. Loads saved credentials, then
+  either rediscovers the core's current `host:port` via
+  `RoonDiscovery(core_id).first()` (handles the Core's IP changing) or,
+  if `--roon-host`/`ROON_HOST` is set, connects directly to that address
+  and skips discovery entirely (see "Docker deployment" below - this is
+  what makes the container-friendly path work at all). Connects with
+  `blocking_init=True`, and registers a state callback on
   `zones_changed`/`zones_seek_changed`.
+
+### Docker deployment
+
+`roon_client/Dockerfile` + root `docker-compose.yml` + `deploy.sh` run
+the daemon as a container on another LAN machine instead of ad hoc on a
+Mac, with `restart: unless-stopped` giving auto-restart-on-crash and
+auto-start-on-boot for free (the persistent-supervisor gap noted below,
+solved a different way than the LaunchAgent that was asked about and
+declined earlier).
+
+**The one thing that actually matters here**: `RoonDiscovery` uses UDP
+multicast broadcast (SOOD, port 9003) to find the Core, and that does
+not cross into a container's default bridge network - a naive
+dockerization would silently fail to find Roon at all. `--roon-host`/
+`ROON_HOST` (added specifically for this) bypasses discovery and
+connects directly to a known IP - a plain outbound TCP connection,
+which works fine from default bridge networking on *any* Docker host.
+The alternative, `--network host` (or `network_mode: host`), would keep
+zero-config discovery working, but **only on Linux Docker hosts** -
+Docker Desktop on Mac/Windows runs containers in a VM and doesn't expose
+true host networking, so that option was rejected as not portable
+enough for "deploy this to some other machine on the LAN" in general.
+Confirmed working end-to-end before shipping: built the image locally,
+ran it with real credentials mounted and `ROON_HOST` set, from default
+bridge networking, and it connected to the actual Roon Core, read real
+zone state, and pushed a real `/clear` to the actual board - not just
+"the container starts without an exception."
+
+**Credentials aren't host-bound.** `roon_core_id.txt`/`roon_token.txt`
+identify this *application* as approved in Roon's Settings > Extensions,
+not the machine that ran `pair.py` - they can be copied to the deploy
+target directly (which is what `deploy.sh` does) rather than re-pairing
+there, which would need a fresh "Enable" click in Roon anyway since
+`pair.py` itself still needs LAN multicast to work (it wasn't updated
+with the same `--roon-host` bypass - it's meant to be run locally, once,
+where discovery already works, not inside the container).
+
+**`docker-compose.yml`'s `build:` context matters even when not
+building.** The compose file specifies both `image:` and `build:
+{context: roon_client}`. `docker compose up -d` uses the already-loaded
+image and does *not* rebuild if that tag already exists locally - but it
+still expects the `roon_client` directory to exist to parse the compose
+file at all. `deploy.sh` copies the whole `roon_client/` directory to
+the remote host (not just the two credential files) specifically
+because of this, even though nothing there ever actually gets built
+remotely.
+
+**`ENV PYTHONUNBUFFERED=1` is set in the Dockerfile itself**, not left
+for whoever runs the container to remember - this is the exact same
+stdout-buffering pitfall noted below (Python's stdout is block-buffered
+off a TTY), and `docker logs` showing nothing is a particularly
+confusing way to rediscover it.
 - **Album art path**: `RoonApi.get_image(image_key, scale='fit', width=64,
   height=64)` returns a URL to Roon Core's *own* `/api/image/<key>`
   endpoint — Core does the fetching/resizing/caching, the extension just

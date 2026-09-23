@@ -1,0 +1,18 @@
+services:
+  roon-display:
+    build:
+      context: roon_client
+    image: roonalbumdisplay:latest
+    restart: unless-stopped
+    environment:
+      # Direct connection, skipping LAN multicast discovery (which doesn't
+      # cross into Docker's default bridge network) - see AGENTS.md.
+      ROON_HOST: "192.168.1.100"
+      ROON_PORT: "9330"
+      PANEL_URL: "http://192.168.1.172"
+      # ZONE: "Living Room"   # optional - default follows whichever zone plays
+    volumes:
+      # Credentials from a local `uv run roon_client/pair.py` run - copy
+      # them here rather than baking them into the image.
+      - ./roon_client/roon_core_id.txt:/app/roon_core_id.txt:ro
+      - ./roon_client/roon_token.txt:/app/roon_token.txt:ro

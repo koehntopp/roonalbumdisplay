@@ -15,10 +15,16 @@ Usage:
 If --zone is omitted, whichever zone is actually playing is shown
 (falling back to a paused zone with art), re-evaluated on every Roon
 state change rather than fixed at startup.
+
+All options can also be set via environment variables (PANEL_URL, ZONE,
+ROON_HOST, ROON_PORT) - see docker-compose.yml. --roon-host skips LAN
+discovery (UDP multicast, which doesn't work from a Docker bridge
+network) and connects directly to a known Roon Core address instead.
 """
 
 import argparse
 import io
+import os
 import sys
 import time
 from pathlib import Path
@@ -49,16 +55,25 @@ def load_credentials():
 	return CORE_ID_FILE.read_text().strip(), TOKEN_FILE.read_text().strip()
 
 
-def connect(core_id):
-	print('Locating Roon core on the LAN...')
-	discover = RoonDiscovery(core_id)
-	server = discover.first()
-	discover.stop()
-	if not server:
-		sys.exit(f'Could not find Roon core {core_id} on the LAN.')
-	host, port = server
+def connect(core_id, roon_host=None, roon_port=None):
+	"""If roon_host is given, connect directly and skip LAN discovery
+	(RoonDiscovery uses UDP multicast, which doesn't cross into a Docker
+	bridge network's isolated subnet without host networking - a direct
+	connection is a plain outbound TCP connection, which works from
+	default bridge networking on any Docker host)."""
 	token = TOKEN_FILE.read_text().strip()
-	print(f'Connecting to {host}:{port}...')
+	if roon_host:
+		host, port = roon_host, roon_port or 9330
+		print(f'Connecting to {host}:{port} (configured directly, skipping discovery)...')
+	else:
+		print('Locating Roon core on the LAN...')
+		discover = RoonDiscovery(core_id)
+		server = discover.first()
+		discover.stop()
+		if not server:
+			sys.exit(f'Could not find Roon core {core_id} on the LAN.')
+		host, port = server
+		print(f'Connecting to {host}:{port}...')
 	return RoonApi(APPINFO, token, host, port, True)
 
 
@@ -119,7 +134,7 @@ def run_once(args):
 	panel_url = args.panel_url.rstrip('/')
 
 	core_id, _ = load_credentials()
-	api = connect(core_id)
+	api = connect(core_id, args.roon_host, args.roon_port)
 
 	# (zone_id, image_key) currently on the panel, so a change of *either*
 	# a different zone taking over playback, or the same zone's art
@@ -240,9 +255,30 @@ def run_once(args):
 
 def main():
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-	parser.add_argument('--panel-url', required=True, help='e.g. http://192.168.1.172')
-	parser.add_argument('--zone', help='Roon zone display name to watch (default: whichever zone is playing)')
+	parser.add_argument(
+		'--panel-url', default=os.environ.get('PANEL_URL'), help='e.g. http://192.168.1.172 (env: PANEL_URL)'
+	)
+	parser.add_argument(
+		'--zone',
+		default=os.environ.get('ZONE'),
+		help='Roon zone display name to watch (env: ZONE; default: whichever zone is playing)',
+	)
+	parser.add_argument(
+		'--roon-host',
+		default=os.environ.get('ROON_HOST'),
+		help='Skip LAN discovery and connect directly to this Roon Core IP (env: ROON_HOST). '
+		'Needed in Docker: LAN discovery uses UDP multicast, which does not cross into a '
+		"container's default bridge network.",
+	)
+	parser.add_argument(
+		'--roon-port',
+		type=int,
+		default=int(os.environ.get('ROON_PORT', '9330')),
+		help='Roon Core port, used only with --roon-host (env: ROON_PORT, default: 9330)',
+	)
 	args = parser.parse_args()
+	if not args.panel_url:
+		parser.error('--panel-url is required (or set the PANEL_URL environment variable)')
 
 	while True:
 		try:

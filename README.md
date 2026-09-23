@@ -179,9 +179,48 @@ to one specific zone regardless of what else is playing elsewhere:
 uv run roon_client/roon_to_matrix.py --panel-url http://<board-ip> --zone "Living Room"
 ```
 
-This runs in the foreground; stop it with Ctrl-C. It's not currently set
-up as a background service (see AGENTS.md for why and how to add one if
-you want it to survive reboots/logins).
+This runs in the foreground; stop it with Ctrl-C. Running it this way on
+a Mac isn't a persistent background service (see AGENTS.md for why a
+LaunchAgent was considered and declined) — for always-on unattended
+operation, deploy it with Docker to another machine on the LAN instead;
+see below.
+
+## Deploying with Docker
+
+`roon_client/` can run as a container on any other machine on your LAN
+(a Linux server, a NAS, a Pi) instead of running ad hoc on a Mac —
+Docker's `restart: unless-stopped` gives you the auto-restart-on-crash
+and auto-start-on-boot behavior that running it manually doesn't.
+
+**The one thing that matters**: `RoonDiscovery` finds your Roon Core via
+UDP multicast broadcast on the LAN, which does not cross into a
+container's default bridge network. `docker-compose.yml` sidesteps this
+entirely by setting `ROON_HOST`/`ROON_PORT` to connect directly to your
+Roon Core's known address, skipping discovery — this needs only a plain
+outbound TCP connection, which works from default bridge networking on
+any Docker host (unlike `--network host`, which only works properly on
+Linux Docker hosts, not Docker Desktop on Mac/Windows). If your Roon
+Core's LAN IP might change, give it a DHCP reservation in your router.
+
+1. Pair locally first if you haven't already (`uv run roon_client/pair.py`
+   — see above). The resulting `roon_client/roon_core_id.txt` and
+   `roon_token.txt` aren't tied to a specific machine, just to this app's
+   identity as approved in Roon, so they can be copied to the deploy
+   target rather than re-paired there.
+2. Edit `docker-compose.yml`'s `ROON_HOST` and `PANEL_URL` to match your
+   setup.
+3. Edit `deploy.sh`'s defaults (`REMOTE_HOST`, or override via
+   `REMOTE_USER=youruser ./deploy.sh`) for your target machine. It builds
+   the image locally, copies it and the compose file/credentials over
+   SSH, and runs `docker compose up -d` there. The target machine needs
+   Docker (with the `docker compose` plugin) already installed — the
+   script doesn't install it.
+4. Run `./deploy.sh`. Check on it afterward with:
+   ```bash
+   ssh youruser@yourhost 'cd ~/roonalbumdisplay && docker compose logs -f'
+   ```
+
+To redeploy after any code change, just run `./deploy.sh` again.
 
 ## Board HTTP API reference
 
@@ -199,11 +238,13 @@ you want it to survive reboots/logins).
 - `device/` — firmware for the Matrix Portal M4 (mirrors what's deployed
   to its CIRCUITPY drive; `settings.toml` with your WiFi credentials
   lives only on the board itself, never in this repo)
-- `roon_client/` — the Mac/host-side Python daemon and one-time pairing
-  script
+- `roon_client/` — the Mac/host-side Python daemon, one-time pairing
+  script, and `Dockerfile`
+- `docker-compose.yml`, `deploy.sh` — Docker deployment to another
+  machine on the LAN (see above)
 - `AGENTS.md` — full technical history: hardware faults diagnosed and
   fixed, firmware design decisions, the Roon zone-selection logic and its
-  two prior bugs, and known rough edges
+  prior bugs, and known rough edges
 
 ## Possible future direction
 
