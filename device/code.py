@@ -112,21 +112,42 @@ def show_status(text):
 BLACK_FLOOR = 8  # below this, R and B already round to 0 in RGB565 (5-bit);
 # clamp G (6-bit) to match, or near-black JPEG noise shows as a green tint.
 
+# 4x4 Bayer ordered-dither matrix. RGB565 truncates R/B to 5 bits and G to
+# 6 (8-step and 4-step rounding respectively) regardless of `bit_depth`,
+# which only controls PWM/refresh, not color resolution - so smooth
+# gradients (skies, skin tones) band visibly without this. Adding a
+# small position-dependent offset before truncating spreads the rounding
+# error across neighboring pixels, which reads as a smoother gradient.
+DITHER_4X4 = (
+    (0, 8, 2, 10),
+    (12, 4, 14, 6),
+    (3, 11, 1, 9),
+    (15, 7, 5, 13),
+)
+
 
 def render():
     global has_image
     data = body
     table = lut
     j = 0
-    for i in range(0, IMAGE_BYTES, 3):
-        r = table[data[i]]
-        g = table[data[i + 1]]
-        b = table[data[i + 2]]
-        if r < BLACK_FLOOR and g < BLACK_FLOOR and b < BLACK_FLOOR:
-            pixels[j] = 0
-        else:
-            pixels[j] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        j += 1
+    i = 0
+    for y in range(HEIGHT):
+        drow = DITHER_4X4[y & 3]
+        for x in range(WIDTH):
+            r = table[data[i]]
+            g = table[data[i + 1]]
+            b = table[data[i + 2]]
+            if r < BLACK_FLOOR and g < BLACK_FLOOR and b < BLACK_FLOOR:
+                pixels[j] = 0
+            else:
+                d = drow[x & 3] - 8  # -8..7: about one 5-bit quantization step
+                r = min(max(r + d, 0), 255)
+                g = min(max(g + (d >> 1), 0), 255)  # G's step is half as coarse
+                b = min(max(b + d, 0), 255)
+                pixels[j] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            i += 3
+            j += 1
     bitmaptools.arrayblit(bitmap, pixels)
     has_image = True
     display.root_group = image_group

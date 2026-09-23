@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 import requests
-from PIL import Image
+from PIL import Image, ImageFilter
 from roonapi import RoonApi, RoonDiscovery
 
 APPINFO = {
@@ -74,6 +74,11 @@ def to_panel_bytes(img):
 	64x64 canvas, and return raw RGB888 bytes."""
 	fitted = img.transpose(Image.ROTATE_90)  # 90 degrees counter-clockwise
 	fitted.thumbnail((PANEL_SIZE, PANEL_SIZE), Image.LANCZOS)
+	# LANCZOS is a good downscale filter, but shrinking full-res art ~8x
+	# still softens edges; a mild unsharp mask at the target resolution
+	# restores some perceived detail. Sharpen after resizing, not before -
+	# sharpening at full res would just get blurred away by the downscale.
+	fitted = fitted.filter(ImageFilter.UnsharpMask(radius=1, percent=60, threshold=2))
 	canvas = Image.new('RGB', (PANEL_SIZE, PANEL_SIZE), (0, 0, 0))
 	x = (PANEL_SIZE - fitted.width) // 2
 	y = (PANEL_SIZE - fitted.height) // 2
