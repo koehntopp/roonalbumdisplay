@@ -1,0 +1,4 @@
+# Copy to /Volumes/CIRCUITPY/settings.toml and fill in.
+# The board only supports 2.4 GHz Wi-Fi.
+CIRCUITPY_WIFI_SSID = "your-ssid"
+CIRCUITPY_WIFI_PASSWORD = "your-password"

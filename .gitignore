@@ -1,0 +1,5 @@
+roon_client/roon_core_id.txt
+roon_client/roon_token.txt
+device/settings.toml
+__pycache__/
+*.pyc
