@@ -269,12 +269,19 @@ SDK. It's what Home Assistant's own Roon integration is built on.
 
 ### Docker deployment
 
-`roon_client/Dockerfile` + root `docker-compose.yml` + `deploy.sh` run
-the daemon as a container on another LAN machine instead of ad hoc on a
-Mac, with `restart: unless-stopped` giving auto-restart-on-crash and
+`roon_client/Dockerfile` + root `compose.yaml` + `deploy.sh` run the
+daemon as a container on another LAN machine instead of ad hoc on a Mac,
+with `restart: unless-stopped` giving auto-restart-on-crash and
 auto-start-on-boot for free (the persistent-supervisor gap noted below,
 solved a different way than the LaunchAgent that was asked about and
 declined earlier).
+
+`deploy.sh` and the `/opt/stacks/<name>` remote path are adapted from a
+working deploy script for another container ("discogs") on the same
+target host, which runs [Dockge](https://github.com/louislam/dockge) -
+matching that project's existing structure/style (variable layout, echo
+messages, the heredoc-based single-SSH-call remote step) rather than
+inventing a different convention, since the same person maintains both.
 
 **The one thing that actually matters here**: `RoonDiscovery` uses UDP
 multicast broadcast (SOOD, port 9003) to find the Core, and that does
@@ -303,15 +310,18 @@ there, which would need a fresh "Enable" click in Roon anyway since
 with the same `--roon-host` bypass - it's meant to be run locally, once,
 where discovery already works, not inside the container).
 
-**`docker-compose.yml`'s `build:` context matters even when not
-building.** The compose file specifies both `image:` and `build:
-{context: roon_client}`. `docker compose up -d` uses the already-loaded
-image and does *not* rebuild if that tag already exists locally - but it
-still expects the `roon_client` directory to exist to parse the compose
-file at all. `deploy.sh` copies the whole `roon_client/` directory to
-the remote host (not just the two credential files) specifically
-because of this, even though nothing there ever actually gets built
-remotely.
+**`compose.yaml` has no `build:` section at all**, deliberately - the
+image is always built locally (`docker buildx build --platform
+linux/amd64 ... --load`) and shipped to the remote host as a tarball
+(`docker save` / `docker load`), referenced purely by tag
+(`image: roonalbumdisplay:latest`). An earlier version kept a `build:`
+stanza pointing at `roon_client/` "just in case", which meant
+`deploy.sh` had to also copy that whole directory to the remote so
+`docker compose` could even parse the file (it expects a `build:`
+context to exist even when nothing is actually rebuilt) - removing
+`build:` entirely was simpler than working around it, and matches how
+the reference `discogs` deploy script on the same host does it too:
+build once locally, ship a tarball, reference by tag only.
 
 **`ENV PYTHONUNBUFFERED=1` is set in the Dockerfile itself**, not left
 for whoever runs the container to remember - this is the exact same

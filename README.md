@@ -194,7 +194,7 @@ and auto-start-on-boot behavior that running it manually doesn't.
 
 **The one thing that matters**: `RoonDiscovery` finds your Roon Core via
 UDP multicast broadcast on the LAN, which does not cross into a
-container's default bridge network. `docker-compose.yml` sidesteps this
+container's default bridge network. `compose.yaml` sidesteps this
 entirely by setting `ROON_HOST`/`ROON_PORT` to connect directly to your
 Roon Core's known address, skipping discovery — this needs only a plain
 outbound TCP connection, which works from default bridge networking on
@@ -202,22 +202,26 @@ any Docker host (unlike `--network host`, which only works properly on
 Linux Docker hosts, not Docker Desktop on Mac/Windows). If your Roon
 Core's LAN IP might change, give it a DHCP reservation in your router.
 
+`deploy.sh` targets a [Dockge](https://github.com/louislam/dockge) stack
+directory (`/opt/stacks/<name>/`) on the remote host — adjust `REMOTE_DIR`
+if you're not using Dockge; any directory `docker compose` can run from
+works the same way.
+
 1. Pair locally first if you haven't already (`uv run roon_client/pair.py`
    — see above). The resulting `roon_client/roon_core_id.txt` and
    `roon_token.txt` aren't tied to a specific machine, just to this app's
    identity as approved in Roon, so they can be copied to the deploy
    target rather than re-paired there.
-2. Edit `docker-compose.yml`'s `ROON_HOST` and `PANEL_URL` to match your
-   setup.
-3. Edit `deploy.sh`'s defaults (`REMOTE_HOST`, or override via
-   `REMOTE_USER=youruser ./deploy.sh`) for your target machine. It builds
-   the image locally, copies it and the compose file/credentials over
-   SSH, and runs `docker compose up -d` there. The target machine needs
-   Docker (with the `docker compose` plugin) already installed — the
-   script doesn't install it.
+2. Edit `compose.yaml`'s `ROON_HOST` and `PANEL_URL` to match your setup.
+3. Edit `deploy.sh`'s `REMOTE_USER`/`REMOTE_HOST`/`REMOTE_DIR` for your
+   target machine. It builds the image locally for `linux/amd64` (adjust
+   if your server is arm64, e.g. a Raspberry Pi), copies it and the
+   compose file/credentials over SSH, and runs `docker compose up -d`
+   there. The target machine needs Docker already installed — the script
+   doesn't install it.
 4. Run `./deploy.sh`. Check on it afterward with:
    ```bash
-   ssh youruser@yourhost 'cd ~/roonalbumdisplay && docker compose logs -f'
+   ssh youruser@yourhost 'cd /opt/stacks/roonalbumdisplay && docker compose logs -f'
    ```
 
 To redeploy after any code change, just run `./deploy.sh` again.
@@ -240,8 +244,8 @@ To redeploy after any code change, just run `./deploy.sh` again.
   lives only on the board itself, never in this repo)
 - `roon_client/` — the Mac/host-side Python daemon, one-time pairing
   script, and `Dockerfile`
-- `docker-compose.yml`, `deploy.sh` — Docker deployment to another
-  machine on the LAN (see above)
+- `compose.yaml`, `deploy.sh` — Docker deployment to another machine on
+  the LAN (see above)
 - `AGENTS.md` — full technical history: hardware faults diagnosed and
   fixed, firmware design decisions, the Roon zone-selection logic and its
   prior bugs, and known rough edges

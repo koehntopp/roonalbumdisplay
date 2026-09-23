@@ -1,60 +1,55 @@
-#!/usr/bin/env bash
-# Builds the roon-display image locally, copies it (and the compose file
-# and Roon credentials) to the Linux box, and (re)starts it there.
-#
-# Usage:
-#   ./deploy.sh                       # uses defaults below
-#   REMOTE_USER=pi ./deploy.sh        # override the SSH user
-#   REMOTE_HOST=192.168.1.50 ./deploy.sh
-#
-# First-time setup on the remote host: Docker (with the `docker compose`
-# plugin) must already be installed there. This script doesn't install it.
-set -euo pipefail
+#!/bin/bash
 
-REMOTE_HOST="${REMOTE_HOST:-192.168.1.97}"
-REMOTE_USER="${REMOTE_USER:-$(whoami)}"
-REMOTE_DIR="${REMOTE_DIR:-~/roonalbumdisplay}"
-IMAGE_NAME="roonalbumdisplay"
-IMAGE_TAG="latest"
+# Exit immediately if a command exits with a non-zero status
+set -e
 
-cd "$(dirname "$0")"
+# --- CONFIGURATION ---
+IMAGE_NAME="roonalbumdisplay:latest"
+TAR_FILE="roonalbumdisplay-linux-amd64.tar"
+REMOTE_USER="koehntopp"
+REMOTE_HOST="192.168.1.97"
+REMOTE_DIR="/opt/stacks/roonalbumdisplay"  # Dockge stack directory (holds compose.yaml + tar during load)
+# ---------------------
 
 for f in roon_client/roon_core_id.txt roon_client/roon_token.txt; do
-	if [[ ! -f "$f" ]]; then
-		echo "Missing $f - run 'uv run roon_client/pair.py' locally first." >&2
-		exit 1
-	fi
+  if [[ ! -f "$f" ]]; then
+    echo "Missing $f - run 'uv run roon_client/pair.py' locally first." >&2
+    exit 1
+  fi
 done
 
-echo "==> Building ${IMAGE_NAME}:${IMAGE_TAG} for linux/amd64..."
-# Building for a specific platform matters if you're building on Apple
-# Silicon and the Linux box is x86_64 - adjust if it's arm64 (e.g. a
-# Raspberry Pi).
-docker build --platform linux/amd64 -t "${IMAGE_NAME}:${IMAGE_TAG}" roon_client
+echo "🚀 1. Building Docker image for Linux architecture..."
+# buildx + --platform is crucial if your Mac is Apple Silicon but the
+# server is Intel/AMD.
+docker buildx build --platform linux/amd64 -t $IMAGE_NAME --load roon_client
 
-TARBALL="/tmp/${IMAGE_NAME}.tar.gz"
-echo "==> Saving image to ${TARBALL}..."
-docker save "${IMAGE_NAME}:${IMAGE_TAG}" | gzip > "$TARBALL"
+echo "📦 2. Saving image to a tarball archive..."
+docker save -o $TAR_FILE $IMAGE_NAME
 
-echo "==> Copying image, compose file, and roon_client/ (incl. credentials) to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}..."
-# roon_client/ is copied whole (not just the two credential files) because
-# docker-compose.yml's build context points at it - compose expects that
-# path to exist even when it won't actually rebuild (the image is already
-# loaded below).
-ssh "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p ${REMOTE_DIR}"
-scp "$TARBALL" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
-scp docker-compose.yml "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
-scp -r roon_client "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
+echo "📁 3. Ensuring remote stack directory exists..."
+ssh ${REMOTE_USER}@${REMOTE_HOST} "mkdir -p ${REMOTE_DIR}"
 
-echo "==> Loading image and starting the service on ${REMOTE_HOST}..."
-# shellcheck disable=SC2029
-ssh "${REMOTE_USER}@${REMOTE_HOST}" "
-	set -e
-	cd ${REMOTE_DIR}
-	gunzip -c $(basename "$TARBALL") | docker load
-	docker compose up -d
-"
+echo "🚀 4. Transferring compose file, Roon credentials, and image via SCP..."
+scp compose.yaml ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/compose.yaml
+scp roon_client/roon_core_id.txt roon_client/roon_token.txt ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/
+scp $TAR_FILE ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/${TAR_FILE}
 
-rm -f "$TARBALL"
-echo "==> Done. Check status with:"
-echo "    ssh ${REMOTE_USER}@${REMOTE_HOST} 'cd ${REMOTE_DIR} && docker compose logs -f'"
+echo "🧹 5. Cleaning up local tarball on Mac..."
+rm $TAR_FILE
+
+echo "🔄 6. Loading image and (re)starting the stack on the Linux box..."
+ssh ${REMOTE_USER}@${REMOTE_HOST} << EOF
+  set -e
+  cd ${REMOTE_DIR}
+
+  echo "📥 Loading image into remote Docker..."
+  docker load -i ${TAR_FILE}
+
+  echo "🧹 Removing remote tarball to save space..."
+  rm ${TAR_FILE}
+
+  echo "🔄 Recreating containers with Docker Compose..."
+  docker compose up -d --remove-orphans
+EOF
+
+echo "✅ Deployment complete!"
