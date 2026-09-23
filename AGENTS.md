@@ -267,8 +267,8 @@ SDK. It's what Home Assistant's own Roon integration is built on.
   height=64)` returns a URL to Roon Core's *own* `/api/image/<key>`
   endpoint — Core does the fetching/resizing/caching, the extension just
   builds the URL. Fetched with `requests`, decoded with Pillow,
-  auto-contrast stretched, resized in linear-ish light with
-  `Image.LANCZOS`, sharpened, letterboxed onto a black 64x64 canvas
+  auto-contrast stretched, resized with `Image.LANCZOS`, sharpened,
+  letterboxed onto a black 64x64 canvas
   (centered `paste`) so non-square art doesn't distort, then sent as raw
   RGB888 to the board.
 - **`ImageFilter.UnsharpMask` after the resize, not before.** Shrinking
@@ -298,18 +298,33 @@ SDK. It's what Home Assistant's own Roon integration is built on.
   re-run that synthetic test before trusting a "looks fine on a few
   tracks" spot check - the failure mode only shows up on images with a
   strong, fairly uniform dominant color, not on typical varied photos.
-- **Gamma-correct (linear-light) resize via `Image.point()` LUTs.**
-  Resizing directly on gamma-encoded (display-referred, i.e. normal sRGB)
-  pixel values is a well-known source of muddy midtones and dark edge
-  halos on a strong downscale (~8x here). `_DECODE_LUT`/`_ENCODE_LUT`
-  approximate an sRGB gamma (2.2) decode before `thumbnail()` and
-  re-encode after, using PIL's per-pixel `point()` LUT (fast, no numpy
-  dependency added). This is an 8-bit round-trip approximation, not a
-  true float/linear pipeline, so some precision is lost, but it's a
-  clear improvement over not doing it for zero added dependencies.
-  **Gotcha already hit once**: `point()` needs the LUT tripled
-  (`lut * 3`) for a 3-band RGB image when passed as a flat list - a bare
-  256-entry list raises `ValueError: wrong number of lut entries`.
+- **Gamma-correct (linear-light) resize — tried, and reverted as broken
+  on real content.** The idea: resizing directly on gamma-encoded
+  (normal sRGB) pixel values is a known source of muddy midtones on a
+  strong downscale, so decode to linear-ish light via `Image.point()`
+  LUTs before `thumbnail()`, re-encode after. Removed after a direct
+  report ("greyscale still really bad") led to reproducing a severe,
+  concrete defect: on a genuinely dark/low-key photo (Taylor Swift's
+  *The Tortured Poets Department* cover - a muted B&W portrait), the
+  output came out with a garish orange/black crushed-contrast cast,
+  confirmed by saving and inspecting every pipeline stage - the
+  corruption was already visible immediately after the gamma-decode
+  step, before resize/sharpen. Root cause: gamma-decoding (`x**2.2`)
+  crushes dark shadow values toward 0 in 8-bit integer space, where
+  there's no longer enough precision to represent them distinctly (many
+  visually-distinct dark input values collapse to the same tiny integer,
+  or to adjacent integers 1 apart that represent a huge *relative*
+  difference at that end of the scale); the subsequent LANCZOS resize
+  then averages/interpolates across those now-degenerate values, and
+  re-encoding expands whatever error resulted back out to a visible
+  color cast. This is a real, structural limitation of doing this in
+  8-bit integers rather than float/linear buffers, not a one-off bug -
+  it will recur on any sufficiently dark source image, and dark/low-key
+  photography is a common album-art style, not a rare edge case. **If
+  gamma-correct resizing is revisited, it needs float or 16-bit
+  intermediate precision (e.g. via numpy) to be safe on real-world dark
+  images** - the 8-bit `point()`-LUT shortcut that made it "free" to add
+  is exactly what makes it unsafe.
 
 ### Zone-selection logic (rewritten three times — read this before touching it again)
 
