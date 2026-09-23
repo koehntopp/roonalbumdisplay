@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 from roonapi import RoonApi, RoonDiscovery
 
 APPINFO = {
@@ -66,18 +66,53 @@ def fetch_art(api, image_key):
 	url = api.get_image(image_key, scale='fit', width=PANEL_SIZE, height=PANEL_SIZE)
 	resp = requests.get(url, timeout=5)
 	resp.raise_for_status()
-	return Image.open(io.BytesIO(resp.content)).convert('RGB')
+	img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+	# The panel can only show a handful of distinct levels per channel
+	# (RGB565 truncation, on top of an already-dim brightness setting).
+	# Album art varies hugely in how much of the 0-255 range it actually
+	# uses; stretching each image's own histogram to the full range before
+	# any of that quantization happens makes much better use of the few
+	# levels available, instead of wasting them on a narrow input range.
+	# cutoff=1 clips 1% at each end so a single stray bright/dark pixel
+	# (e.g. a small logo) doesn't defeat the stretch. preserve_tone=True is
+	# essential here: the default stretches R, G, and B independently based
+	# on each channel's own min/max, with no regard for their relationship -
+	# a strong solid-color background (e.g. green album art) can end up with
+	# each channel stretched completely differently, producing a wrong hue
+	# or even crushing the background to black. preserve_tone computes one
+	# shared tone curve instead, so color balance survives the stretch.
+	return ImageOps.autocontrast(img, cutoff=1, preserve_tone=True)
+
+
+# Approximate sRGB gamma (2.2) decode/encode tables, applied via PIL's fast
+# per-pixel point() LUT. Resizing directly on gamma-encoded (display-referred)
+# values is a well-known source of muddy midtones and dark edge halos on a
+# strong downscale (~8x here) - decoding to linear-ish light before the
+# resize and re-encoding after gives a noticeably cleaner result, especially
+# on high-contrast images. This is an 8-bit approximation (some precision is
+# lost in the round-trip), not a true float/linear pipeline, but costs
+# nothing extra to add (pure PIL, no numpy) and is a clear improvement over
+# not doing it at all.
+_GAMMA = 2.2
+# tripled: PIL's point() needs one 256-entry table per band for a 3-band
+# (RGB) image when passed as a flat list, not a single shared 256-entry one.
+_DECODE_LUT = [round(255 * (i / 255) ** _GAMMA) for i in range(256)] * 3
+_ENCODE_LUT = [round(255 * (i / 255) ** (1 / _GAMMA)) for i in range(256)] * 3
 
 
 def to_panel_bytes(img):
-	"""Rotate for the physical stand orientation, letterbox onto a black
-	64x64 canvas, and return raw RGB888 bytes."""
+	"""Rotate for the physical stand orientation, resize in linear-ish
+	light, letterbox onto a black 64x64 canvas, and return raw RGB888
+	bytes."""
 	fitted = img.transpose(Image.ROTATE_90)  # 90 degrees counter-clockwise
+	fitted = fitted.point(_DECODE_LUT)
 	fitted.thumbnail((PANEL_SIZE, PANEL_SIZE), Image.LANCZOS)
+	fitted = fitted.point(_ENCODE_LUT)
 	# LANCZOS is a good downscale filter, but shrinking full-res art ~8x
 	# still softens edges; a mild unsharp mask at the target resolution
-	# restores some perceived detail. Sharpen after resizing, not before -
-	# sharpening at full res would just get blurred away by the downscale.
+	# restores some perceived detail. Sharpen after resizing (and after
+	# re-encoding back to display gamma), not before - sharpening at full
+	# res would just get blurred away by the downscale.
 	fitted = fitted.filter(ImageFilter.UnsharpMask(radius=1, percent=60, threshold=2))
 	canvas = Image.new('RGB', (PANEL_SIZE, PANEL_SIZE), (0, 0, 0))
 	x = (PANEL_SIZE - fitted.width) // 2

@@ -233,16 +233,50 @@ SDK. It's what Home Assistant's own Roon integration is built on.
 - **Album art path**: `RoonApi.get_image(image_key, scale='fit', width=64,
   height=64)` returns a URL to Roon Core's *own* `/api/image/<key>`
   endpoint — Core does the fetching/resizing/caching, the extension just
-  builds the URL. Fetched with `requests`, decoded with Pillow, resized
-  with `Image.LANCZOS` (`thumbnail`), sharpened, letterboxed onto a black
-  64x64 canvas (centered `paste`) so non-square art doesn't distort, then
-  sent as raw RGB888 to the board.
+  builds the URL. Fetched with `requests`, decoded with Pillow,
+  auto-contrast stretched, resized in linear-ish light with
+  `Image.LANCZOS`, sharpened, letterboxed onto a black 64x64 canvas
+  (centered `paste`) so non-square art doesn't distort, then sent as raw
+  RGB888 to the board.
 - **`ImageFilter.UnsharpMask` after the resize, not before.** Shrinking
   full-resolution album art roughly 8x with LANCZOS is already a good
   downscale filter, but still net-softens edges. Sharpening is applied
   *after* `thumbnail()`, at the target 64px resolution — sharpening at
   full res first would just get blurred away by the downscale afterward,
   so the ordering matters, not just the presence of a sharpen step.
+- **`ImageOps.autocontrast(img, cutoff=1, preserve_tone=True)`** in
+  `fetch_art()`, added after comparing against a commercial product
+  (Tuneshine) whose rendering looked noticeably smoother. The panel can
+  only show a handful of distinct levels per channel, and album art
+  varies hugely in how much of the 0-255 range it actually uses;
+  stretching each image's own histogram to the full range before any of
+  that quantization makes much better use of the few levels available.
+  **`preserve_tone=True` is not optional** - it was added to the call
+  only after a real, reproduced bug: the *default* `autocontrast`
+  stretches R, G, and B independently based on each channel's own
+  min/max, with no regard for their relationship. A solid, strongly
+  colored background (reported live: "something's wrong when the
+  background is green") can end up with each channel stretched
+  completely differently - reproduced with a synthetic test image, a
+  `(20, 140, 30)` green background was crushed to pure `(0, 0, 0)` black
+  by the default call, while `preserve_tone=True` (a single shared tone
+  curve across channels, available since Pillow 8.2.0) kept it
+  recognizably green. If this autocontrast call is ever touched again,
+  re-run that synthetic test before trusting a "looks fine on a few
+  tracks" spot check - the failure mode only shows up on images with a
+  strong, fairly uniform dominant color, not on typical varied photos.
+- **Gamma-correct (linear-light) resize via `Image.point()` LUTs.**
+  Resizing directly on gamma-encoded (display-referred, i.e. normal sRGB)
+  pixel values is a well-known source of muddy midtones and dark edge
+  halos on a strong downscale (~8x here). `_DECODE_LUT`/`_ENCODE_LUT`
+  approximate an sRGB gamma (2.2) decode before `thumbnail()` and
+  re-encode after, using PIL's per-pixel `point()` LUT (fast, no numpy
+  dependency added). This is an 8-bit round-trip approximation, not a
+  true float/linear pipeline, so some precision is lost, but it's a
+  clear improvement over not doing it for zero added dependencies.
+  **Gotcha already hit once**: `point()` needs the LUT tripled
+  (`lut * 3`) for a 3-band RGB image when passed as a flat list - a bare
+  256-entry list raises `ValueError: wrong number of lut entries`.
 
 ### Zone-selection logic (rewritten twice — read this before touching it again)
 
