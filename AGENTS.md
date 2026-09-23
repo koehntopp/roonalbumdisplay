@@ -130,6 +130,24 @@ Key implementation decisions:
   packing it through the asymmetric bit masks. This only affects pixels
   that would already be crushed to zero in two of three channels, so it
   doesn't visibly clip legitimate dark colors.
+- **4x4 Bayer ordered dithering in `render()`**, added after a direct
+  question about image quality. `bit_depth` (see above) only controls
+  PWM/refresh timing, not color *resolution* — RGB565 always truncates to
+  5 bits (R/B) and 6 bits (G) per channel regardless of `bit_depth`, so
+  smooth gradients (skies, skin tones) band visibly no matter how high
+  `bit_depth` is set. `DITHER_4X4` adds a small position-dependent offset
+  (`drow[x & 3] - 8`, roughly one quantization step, halved for G since
+  its step is half as coarse) to each channel *before* the `0xF8`/`0xFC`
+  truncation, spreading the rounding error across neighboring pixels so
+  it reads as a smoother gradient instead of visible bands. Runs *after*
+  the `BLACK_FLOOR` check, using the undithered values for that
+  comparison — dithering true-black pixels would reintroduce a
+  colored-near-black artifact of exactly the kind `BLACK_FLOOR` was added
+  to fix. Confirmed live: render time per `/image` push went from
+  ~0.3-0.4s to ~0.7s with dithering active — still trivial for an
+  occasional track-change update, but worth knowing if this loop is ever
+  extended further (e.g. real Floyd-Steinberg error diffusion, which
+  would cost more).
 - **Default brightness is `0.1`** (`settings` dict default), chosen after
   live A/B testing at 1.0 → 0.5 → 0.3 → 0.2 → 0.1 against a real P3 panel,
   which is very bright by spec (1000+ cd/m² is typical for this panel
@@ -215,9 +233,16 @@ SDK. It's what Home Assistant's own Roon integration is built on.
 - **Album art path**: `RoonApi.get_image(image_key, scale='fit', width=64,
   height=64)` returns a URL to Roon Core's *own* `/api/image/<key>`
   endpoint — Core does the fetching/resizing/caching, the extension just
-  builds the URL. Fetched with `requests`, decoded with Pillow, letterboxed
-  onto a black 64x64 canvas (`thumbnail` + centered `paste`) so non-square
-  art doesn't distort, then sent as raw RGB888 to the board.
+  builds the URL. Fetched with `requests`, decoded with Pillow, resized
+  with `Image.LANCZOS` (`thumbnail`), sharpened, letterboxed onto a black
+  64x64 canvas (centered `paste`) so non-square art doesn't distort, then
+  sent as raw RGB888 to the board.
+- **`ImageFilter.UnsharpMask` after the resize, not before.** Shrinking
+  full-resolution album art roughly 8x with LANCZOS is already a good
+  downscale filter, but still net-softens edges. Sharpening is applied
+  *after* `thumbnail()`, at the target 64px resolution — sharpening at
+  full res first would just get blurred away by the downscale afterward,
+  so the ordering matters, not just the presence of a sharpen step.
 
 ### Zone-selection logic (rewritten twice — read this before touching it again)
 
