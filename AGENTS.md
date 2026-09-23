@@ -196,6 +196,65 @@ Key implementation decisions:
   (not in this repo — only `settings.toml.example` is checked in). 2.4GHz
   only, per CircuitPython's ESP32SPI limitations on this board.
 
+### Morphing between images, and a real near-crash while building it
+
+Requested directly: "morph images into the new one instead of just
+swapping." `render_blend()` interpolates, per pixel per channel, between
+`prev_r/g/b` (the currently-displayed frame's LUT'd values) and the
+incoming target (decoded fresh from `body`/`lut` inline, not stored
+separately - see below), over `TRANSITION_STEPS` discrete steps, each
+step going through the same dither+quantize+blit path as a normal
+render. `render(instant=True)` skips this entirely and shows the target
+in one step - used for `/clear` (still an unambiguous hardware
+diagnostic, see above - a fade would undermine that) and for
+`/settings` (a live brightness/contrast/gamma tweak should be immediate
+feedback, not a multi-second fade to the same image).
+
+**Integer math only.** The first version used a float 0.0-1.0 blend
+factor (`from + (to - from) * t`, `t` a float). Switched to integer
+`step`/`steps` (`from + (to - from) * step // steps`) after timing
+became inconsistent under load (see below) - float math allocates a new
+float object per operation on this interpreter, adding real per-pixel
+cost and GC garbage that integer arithmetic avoids. At `step == steps`
+the formula reduces to exactly the target value regardless of what
+`prev_r/g/b` currently holds (integer `(k*n)//n == k` exactly), which is
+what makes it safe to reuse the same function for both the instant and
+morphing cases with no special-casing.
+
+**A real near-crash, and the actual fix (not just a band-aid).** The
+first working version kept *six* persistent 4096-byte buffers:
+`prev_r/g/b` for the currently-shown frame, plus `new_r/g/b`, pre-decoded
+once per `/image` call to avoid recomputing `table[data[i]]` on every
+blend step. That is a plausible-sounding optimization that turned out to
+be a mistake: those extra 12KB of permanently-allocated RAM, on top of
+everything else already resident, pushed this board to the edge under
+normal repeated use - free memory was directly observed dropping to
+**2,212 bytes**, and one `/clear` request failed outright
+(`ConnectionError` / `RemoteDisconnected`, the board's socket layer
+aborting the connection under memory pressure). The fix was not to raise
+timeouts or add more `gc.collect()` calls - it was to question whether
+`new_r/g/b` needed to exist as *persistent* buffers at all. They didn't:
+`body` and `lut` don't change during a single render, so the target
+value for a given pixel/channel is just as cheap to look up fresh
+(`table[data[i]]`, one array index) inside `render_blend()`'s loop on
+every step as it would be to read from a pre-decoded array - the
+"optimization" of pre-decoding was never actually saving meaningful
+work, only spending 12KB of scarce RAM to avoid a single array lookup
+that has to happen at least once per pixel either way. Cutting `new_r/g/b`
+entirely (down to just the 3 `prev_r/g/b` buffers) raised steady-state
+free memory from the low-20s-KB to a stable **~44KB** under the same
+repeated-push stress test, with zero failures. **The general lesson**:
+when a microcontroller this memory-constrained is under real pressure,
+look for buffers that don't need to be *persistent* at all before
+reaching for more headroom elsewhere (bigger timeouts, more frequent
+GC, fewer steps) - those treat the symptom, this removed the cause.
+`TRANSITION_STEPS = 5` was also chosen empirically after direct timing
+on real hardware (a full 5-step morph: ~1.1-1.4s/step, so ~5.1-5.7s
+total, quite consistent run to run) rather than guessed - an earlier
+guess of 8 steps produced a one-off ~12s outlier under the old
+6-buffer/float-math version, which is what prompted timing it properly
+in the first place rather than trusting a single fast-looking sample.
+
 **Sync discipline:** `device/code.py` in this repo and
 `/Volumes/CIRCUITPY/code.py` on the board are two separate files with no
 automatic sync — every firmware change needs an explicit
@@ -278,11 +337,11 @@ SDK. It's what Home Assistant's own Roon integration is built on.
   (`lut * 3`) for a 3-band RGB image when passed as a flat list - a bare
   256-entry list raises `ValueError: wrong number of lut entries`.
 
-### Zone-selection logic (rewritten twice — read this before touching it again)
+### Zone-selection logic (rewritten three times — read this before touching it again)
 
 This setup has multiple Roon zones (a living-room zone, and two others,
 one of which is what's actually used day-to-day). The "which zone do we
-show" logic went through two real bugs before landing on the current
+show" logic went through three real bugs before landing on the current
 design:
 
 1. **v1 (broken):** picked literally the first zone in Roon's reported
@@ -301,20 +360,42 @@ design:
    every single track change. (Observed concretely: a zone sat paused all
    session on an old track, and its art kept flashing in between every
    track change on the actually-playing zone.)
-3. **v3 (current):** sticky zone tracking via a `state['shown'] =
-   (zone_id, image_key)` tuple. Once a zone is being displayed, a brief
-   non-`'playing'` blip (`state in ('loading', 'paused')`) *in that same
-   zone* just holds the current frame (a `KEEP` sentinel — no panel
-   update at all) instead of switching away. The arbitrary-paused-zone
-   fallback only fires when **nothing has ever been shown yet** (cold
-   start with no zone actively playing). The panel only actually switches
-   zones when the tracked zone truly stops, or a genuinely different zone
-   starts playing.
+3. **v3:** sticky zone tracking via a `state['shown'] = (zone_id,
+   image_key)` tuple. Once a zone is being displayed, a brief
+   non-`'playing'` blip (originally `state in ('loading', 'paused')`)
+   *in that same zone* just holds the current frame (a `KEEP` sentinel —
+   no panel update at all) instead of switching away. Also fell back to
+   an arbitrary paused zone's art at cold start (nothing shown yet).
+4. **v4 (current):** requested directly - "when nothing plays, turn off
+   the screen." This meant removing the cold-start paused-zone fallback
+   entirely (nothing playing should mean the panel is off, full stop,
+   not "show whatever some other zone happened to pause on"), and
+   narrowing the `KEEP` grace period from *both* `'loading'` and
+   `'paused'` down to `'loading'` only - `'paused'` is a deliberate user
+   action and should turn the screen off like any other "nothing
+   playing" case; only the sub-second `'loading'` blip between tracks on
+   the zone you're already tracking should hold the current frame.
+   **A real bug found immediately after**: `state['shown']` started as
+   `None`, which is indistinguishable from "confirmed cleared" - so a
+   fresh process start with nothing playing satisfied the `if
+   state['shown'] is not None` guard trivially (it already was `None`)
+   and `clear_panel()` never actually ran, silently leaving whatever was
+   physically on the panel from before the process started (a leftover
+   manual test image, in the case this was caught). Fixed with a
+   dedicated `UNKNOWN = object()` sentinel, distinct from `None`, as the
+   initial value - `None` now means "confirmed off", `UNKNOWN` means
+   "we don't yet know what's on the physical panel, so clear it to find
+   out." This also required auditing every other `state['shown']` truthy
+   check (`if state['shown']:`) in `pick_active_zone()`, since those
+   assumed the only possibilities were `None` (falsy) or a real tuple
+   (truthy) - a bare `object()` is *also* truthy, so those checks would
+   have then tried to subscript `UNKNOWN[0]` and crashed. If you add
+   another sentinel value to this state machine, grep for every use of
+   `state['shown']` first, not just the one you're changing.
 
 If this needs further work (e.g. handling simultaneous multi-room
-playback more thoughtfully, or a zone that pauses for a long time and
-should eventually clear rather than hold forever), start from the v3
-design above rather than re-deriving zone selection from scratch.
+playback more thoughtfully), start from the v4 design above rather than
+re-deriving zone selection from scratch.
 
 ### Known transient issue (not fixed, just observed)
 

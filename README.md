@@ -185,9 +185,11 @@ you want it to survive reboots/logins).
 
 ## Board HTTP API reference
 
-- `POST /image` — raw 64x64 RGB888 body (exactly 12288 bytes), displays it
-- `POST /clear` — blanks the panel (also useful as a hardware diagnostic —
-  see above)
+- `POST /image` — raw 64x64 RGB888 body (exactly 12288 bytes); morphs into
+  it from whatever's currently shown (~1-2s per step, a handful of steps —
+  see AGENTS.md), rather than swapping instantly
+- `POST /clear` — blanks the panel instantly, no morph (also useful as a
+  hardware diagnostic — see above)
 - `POST /settings?brightness=0-1&contrast=0-4&gamma=0.1-5` — any subset of
   these query parameters
 - `GET /settings` — current brightness/contrast/gamma

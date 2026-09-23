@@ -122,7 +122,10 @@ def to_panel_bytes(img):
 
 
 def push_image(panel_url, raw_rgb888):
-	resp = requests.post(f'{panel_url}/image', data=raw_rgb888, timeout=5)
+	# The board morphs from whatever's currently shown before responding, so
+	# this can legitimately take a couple of seconds now - well above the 5s
+	# that was fine when it rendered instantly.
+	resp = requests.post(f'{panel_url}/image', data=raw_rgb888, timeout=15)
 	resp.raise_for_status()
 
 
@@ -144,7 +147,12 @@ def run_once(args):
 	# (zone_id, image_key) currently on the panel, so a change of *either*
 	# a different zone taking over playback, or the same zone's art
 	# changing, triggers a redraw. None means the panel shows nothing.
-	state = {'shown': None}
+	# 'shown' starts as UNKNOWN (distinct from None) so a fresh start with
+	# nothing playing still actively clears the panel, rather than trusting
+	# whatever was already physically on it (leftover from a previous run,
+	# a manual test push, etc.) to already be blank.
+	UNKNOWN = object()
+	state = {'shown': UNKNOWN}
 
 	def candidate_zones():
 		if args.zone:
@@ -167,28 +175,33 @@ def run_once(args):
 
 		Roon reports a zone as briefly "loading" between tracks rather
 		than "playing" continuously, so a zone we're already tracking
-		gets a grace period (KEEP) instead of falling through to some
-		unrelated zone that's merely sitting paused on old content -
-		that unrelated-paused-zone fallback only applies at startup,
-		before anything has ever been shown.
+		gets a grace period (KEEP) for that specific transient state
+		only - not for "paused", which is a deliberate pause and should
+		turn the screen off like any other "nothing playing" case.
+
+		If nothing anywhere is playing, returns None - the panel turns
+		off rather than showing a paused zone's possibly old/stale art.
+		This intentionally does *not* fall back to a paused zone even at
+		startup (an earlier version did); "nothing playing" should mean
+		"screen off", full stop.
 		"""
 		zones = candidate_zones()
+		shown = state['shown']
+		shown_zone_id = shown[0] if shown not in (None, UNKNOWN) else None
 		playing = [z for z in zones if z.get('state') == 'playing' and (z.get('now_playing') or {}).get('image_key')]
 		if playing:
-			if state['shown']:
+			if shown_zone_id:
 				for z in playing:
-					if z['zone_id'] == state['shown'][0]:
+					if z['zone_id'] == shown_zone_id:
 						return z
 			return playing[0]
 
-		if state['shown']:
-			last_zone = api.zones.get(state['shown'][0])
-			if last_zone and last_zone.get('state') in ('loading', 'paused'):
+		if shown_zone_id:
+			last_zone = api.zones.get(shown_zone_id)
+			if last_zone and last_zone.get('state') == 'loading':
 				return KEEP
-			return None  # the zone we were tracking actually stopped
 
-		paused = [z for z in zones if z.get('state') == 'paused' and (z.get('now_playing') or {}).get('image_key')]
-		return paused[0] if paused else None
+		return None
 
 	def refresh():
 		zone = pick_active_zone()

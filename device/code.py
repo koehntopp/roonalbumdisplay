@@ -82,6 +82,24 @@ has_image = False
 settings = {b"brightness": 0.1, b"contrast": 1.0, b"gamma": 1.0}
 lut = bytearray(range(256))
 
+# Per-channel LUT'd values (post-brightness/contrast/gamma, pre-dither) for
+# the currently-displayed frame, so a new /image can be morphed in from
+# whatever's already on screen instead of swapped instantly. The *target*
+# frame's per-channel values are deliberately NOT also persisted here -
+# they're recomputed from `body`/`lut` on the fly in each blend step
+# (cheap: one array lookup per channel) instead. An earlier version kept
+# both "prev" and "new" as separate persistent buffers (6 * 4096 bytes);
+# that measurably pushed this board toward memory exhaustion (free memory
+# was observed dropping to ~2KB under normal use, with one request
+# actually failing outright), so only the 3 "prev" buffers (half the
+# footprint) are kept permanently allocated.
+NUM_PIXELS = WIDTH * HEIGHT
+prev_r = bytearray(NUM_PIXELS)
+prev_g = bytearray(NUM_PIXELS)
+prev_b = bytearray(NUM_PIXELS)
+TRANSITION_STEPS = 5  # fewer steps = less total per-pixel work per morph;
+# tune down further if renders are still slow/inconsistent on real hardware
+
 
 def build_lut():
     contrast = settings[b"contrast"]
@@ -126,18 +144,37 @@ DITHER_4X4 = (
 )
 
 
-def render():
-    global has_image
-    data = body
-    table = lut
+def render_blend(data, table, step, steps, update_prev):
+    """Interpolate `step`/`steps` of the way (integers, 1..steps) from
+    `prev_r/g/b` toward `data` (the target frame, decoded fresh through
+    `table` for each pixel rather than pre-decoded into another persistent
+    buffer), dither+quantize to RGB565, and blit. step == steps is an exact,
+    un-morphed render of the target frame regardless of what prev_r/g/b
+    currently holds (the "from" contribution cancels out exactly via
+    integer arithmetic when step == steps). Pass update_prev=True on the
+    final step to also update prev_r/g/b in place for the next call - only
+    on the final step, since intermediate steps must keep interpolating
+    from the *original* starting frame throughout the whole sequence.
+
+    Integer math throughout (no float multiply/int() per pixel) - an
+    earlier version used a float 0.0-1.0 factor, which measurably added to
+    render time and per-pixel garbage on this memory-constrained
+    interpreter."""
     j = 0
     i = 0
     for y in range(HEIGHT):
         drow = DITHER_4X4[y & 3]
         for x in range(WIDTH):
-            r = table[data[i]]
-            g = table[data[i + 1]]
-            b = table[data[i + 2]]
+            to_r = table[data[i]]
+            to_g = table[data[i + 1]]
+            to_b = table[data[i + 2]]
+            r = prev_r[j] + (to_r - prev_r[j]) * step // steps
+            g = prev_g[j] + (to_g - prev_g[j]) * step // steps
+            b = prev_b[j] + (to_b - prev_b[j]) * step // steps
+            if update_prev:
+                prev_r[j] = r
+                prev_g[j] = g
+                prev_b[j] = b
             if r < BLACK_FLOOR and g < BLACK_FLOOR and b < BLACK_FLOOR:
                 pixels[j] = 0
             else:
@@ -149,6 +186,27 @@ def render():
             i += 3
             j += 1
     bitmaptools.arrayblit(bitmap, pixels)
+
+
+def render(instant=False):
+    """Display `body`. Morphs from whatever's currently shown unless
+    `instant` is set (used for /clear, so it stays useful as an
+    unambiguous hardware diagnostic - see AGENTS.md - and for /settings,
+    where a live brightness/contrast/gamma tweak should take effect
+    immediately, not fade in over a second)."""
+    global has_image
+    data = body
+    table = lut
+
+    if has_image and not instant:
+        gc.collect()  # start the morph on a clean heap, so a GC pause is
+        # less likely to land mid-animation and stall one step for a while
+        for step in range(1, TRANSITION_STEPS + 1):
+            watchdog.feed()  # a full morph can run for a couple of seconds
+            render_blend(data, table, step, TRANSITION_STEPS, step == TRANSITION_STEPS)
+    else:
+        render_blend(data, table, 1, 1, True)
+
     has_image = True
     display.root_group = image_group
 
@@ -172,7 +230,8 @@ def apply_settings(query):
     settings.update(new)
     build_lut()
     if has_image:
-        render()
+        render(instant=True)  # a brightness/contrast/gamma tweak should be
+        # immediate feedback, not a multi-second fade to the same image
     return None
 
 
@@ -240,7 +299,9 @@ def handle(client):
             respond(client, "200 OK", settings_json(), "application/json")
     elif method == b"POST" and path == b"/clear":
         body[:] = bytes(IMAGE_BYTES)
-        render()
+        render(instant=True)  # instant, not morphed: /clear is also used as
+        # an unambiguous hardware diagnostic (see AGENTS.md) - a fade would
+        # undermine that
         respond(client, "200 OK", "cleared\n")
     elif method == b"POST" and path == b"/image":
         if length != IMAGE_BYTES:
