@@ -122,10 +122,7 @@ def to_panel_bytes(img):
 
 
 def push_image(panel_url, raw_rgb888):
-	# The board morphs from whatever's currently shown before responding, so
-	# this can legitimately take a couple of seconds now - well above the 5s
-	# that was fine when it rendered instantly.
-	resp = requests.post(f'{panel_url}/image', data=raw_rgb888, timeout=15)
+	resp = requests.post(f'{panel_url}/image', data=raw_rgb888, timeout=5)
 	resp.raise_for_status()
 
 

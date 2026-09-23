@@ -196,64 +196,38 @@ Key implementation decisions:
   (not in this repo — only `settings.toml.example` is checked in). 2.4GHz
   only, per CircuitPython's ESP32SPI limitations on this board.
 
-### Morphing between images, and a real near-crash while building it
+### Morphing between images — tried, and reverted as too slow for this board
 
-Requested directly: "morph images into the new one instead of just
-swapping." `render_blend()` interpolates, per pixel per channel, between
-`prev_r/g/b` (the currently-displayed frame's LUT'd values) and the
-incoming target (decoded fresh from `body`/`lut` inline, not stored
-separately - see below), over `TRANSITION_STEPS` discrete steps, each
-step going through the same dither+quantize+blit path as a normal
-render. `render(instant=True)` skips this entirely and shows the target
-in one step - used for `/clear` (still an unambiguous hardware
-diagnostic, see above - a fade would undermine that) and for
-`/settings` (a live brightness/contrast/gamma tweak should be immediate
-feedback, not a multi-second fade to the same image).
+Requested directly ("morph images into the new one instead of just
+swapping"), built, then explicitly reverted minutes later ("the board's
+too slow for that"). Worth recording so it isn't re-attempted blind:
 
-**Integer math only.** The first version used a float 0.0-1.0 blend
-factor (`from + (to - from) * t`, `t` a float). Switched to integer
-`step`/`steps` (`from + (to - from) * step // steps`) after timing
-became inconsistent under load (see below) - float math allocates a new
-float object per operation on this interpreter, adding real per-pixel
-cost and GC garbage that integer arithmetic avoids. At `step == steps`
-the formula reduces to exactly the target value regardless of what
-`prev_r/g/b` currently holds (integer `(k*n)//n == k` exactly), which is
-what makes it safe to reuse the same function for both the instant and
-morphing cases with no special-casing.
-
-**A real near-crash, and the actual fix (not just a band-aid).** The
-first working version kept *six* persistent 4096-byte buffers:
-`prev_r/g/b` for the currently-shown frame, plus `new_r/g/b`, pre-decoded
-once per `/image` call to avoid recomputing `table[data[i]]` on every
-blend step. That is a plausible-sounding optimization that turned out to
-be a mistake: those extra 12KB of permanently-allocated RAM, on top of
-everything else already resident, pushed this board to the edge under
-normal repeated use - free memory was directly observed dropping to
-**2,212 bytes**, and one `/clear` request failed outright
-(`ConnectionError` / `RemoteDisconnected`, the board's socket layer
-aborting the connection under memory pressure). The fix was not to raise
-timeouts or add more `gc.collect()` calls - it was to question whether
-`new_r/g/b` needed to exist as *persistent* buffers at all. They didn't:
-`body` and `lut` don't change during a single render, so the target
-value for a given pixel/channel is just as cheap to look up fresh
-(`table[data[i]]`, one array index) inside `render_blend()`'s loop on
-every step as it would be to read from a pre-decoded array - the
-"optimization" of pre-decoding was never actually saving meaningful
-work, only spending 12KB of scarce RAM to avoid a single array lookup
-that has to happen at least once per pixel either way. Cutting `new_r/g/b`
-entirely (down to just the 3 `prev_r/g/b` buffers) raised steady-state
-free memory from the low-20s-KB to a stable **~44KB** under the same
-repeated-push stress test, with zero failures. **The general lesson**:
-when a microcontroller this memory-constrained is under real pressure,
-look for buffers that don't need to be *persistent* at all before
-reaching for more headroom elsewhere (bigger timeouts, more frequent
-GC, fewer steps) - those treat the symptom, this removed the cause.
-`TRANSITION_STEPS = 5` was also chosen empirically after direct timing
-on real hardware (a full 5-step morph: ~1.1-1.4s/step, so ~5.1-5.7s
-total, quite consistent run to run) rather than guessed - an earlier
-guess of 8 steps produced a one-off ~12s outlier under the old
-6-buffer/float-math version, which is what prompted timing it properly
-in the first place rather than trusting a single fast-looking sample.
+- Implementation was a per-pixel integer interpolation between the
+  currently-shown frame and the incoming target, over a handful of
+  discrete steps, each going through the full dither+quantize+blit path.
+- **Measured cost on real hardware: ~1.1-1.4s per step.** Even with the
+  minimum viable step count, a full transition ran ~5-6s - clearly too
+  slow to feel like a "morph" rather than a stall, on this board's
+  120MHz single-core CircuitPython interpreter.
+- Building it surfaced a real, separate near-crash worth remembering
+  regardless of the morph feature's fate: keeping *two* full sets of
+  per-channel pixel buffers (one for "current", one for "incoming
+  target", pre-decoded to avoid recomputing a lookup) pushed free memory
+  down to 2,212 bytes and caused one request to fail outright. The
+  target frame's values are just as cheap to look up fresh
+  (`table[data[i]]`, one array index) inside a render loop as to
+  pre-decode into another persistent array — pre-decoding wasn't
+  actually saving meaningful work, only spending scarce RAM. **If any
+  future feature here needs to remember more than one frame's worth of
+  per-pixel state, don't persist both as separate full buffers without
+  checking whether one side can be recomputed on the fly instead.**
+- If morphing is revisited, doing the interpolation as a genuinely
+  simpler blend (e.g. skip dithering on intermediate frames, or use a
+  cheaper cross-fade via `bit_depth`/OE duty cycle rather than
+  per-pixel Python math) would need to land well under 1s/step before
+  it's worth trying again on this specific board. A faster
+  microcontroller (see "Possible future direction: ESP32-S3" below)
+  would also change this calculus.
 
 **Sync discipline:** `device/code.py` in this repo and
 `/Volumes/CIRCUITPY/code.py` on the board are two separate files with no
