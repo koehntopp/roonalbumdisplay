@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir roonapi requests Pillow
 
 COPY roon_to_matrix.py .
 
-# Credentials (roon_core_id.txt, roon_token.txt) are bind-mounted at
-# runtime, not baked into the image - see docker-compose.yml.
+# Credentials (roon_core_id.txt, roon_token.txt) are mounted at runtime
+# (from an NFS volume on the NAS), not baked into the image - see
+# compose.yaml and AGENTS.md ("Docker deployment").
 ENTRYPOINT ["python", "roon_to_matrix.py"]

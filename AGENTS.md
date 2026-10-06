@@ -267,67 +267,6 @@ SDK. It's what Home Assistant's own Roon integration is built on.
   `blocking_init=True`, and registers a state callback on
   `zones_changed`/`zones_seek_changed`.
 
-### Docker deployment
-
-`roon_client/Dockerfile` + root `compose.yaml` + `deploy.sh` run the
-daemon as a container on another LAN machine instead of ad hoc on a Mac,
-with `restart: unless-stopped` giving auto-restart-on-crash and
-auto-start-on-boot for free (the persistent-supervisor gap noted below,
-solved a different way than the LaunchAgent that was asked about and
-declined earlier).
-
-`deploy.sh` and the `/opt/stacks/<name>` remote path are adapted from a
-working deploy script for another container ("discogs") on the same
-target host, which runs [Dockge](https://github.com/louislam/dockge) -
-matching that project's existing structure/style (variable layout, echo
-messages, the heredoc-based single-SSH-call remote step) rather than
-inventing a different convention, since the same person maintains both.
-
-**The one thing that actually matters here**: `RoonDiscovery` uses UDP
-multicast broadcast (SOOD, port 9003) to find the Core, and that does
-not cross into a container's default bridge network - a naive
-dockerization would silently fail to find Roon at all. `--roon-host`/
-`ROON_HOST` (added specifically for this) bypasses discovery and
-connects directly to a known IP - a plain outbound TCP connection,
-which works fine from default bridge networking on *any* Docker host.
-The alternative, `--network host` (or `network_mode: host`), would keep
-zero-config discovery working, but **only on Linux Docker hosts** -
-Docker Desktop on Mac/Windows runs containers in a VM and doesn't expose
-true host networking, so that option was rejected as not portable
-enough for "deploy this to some other machine on the LAN" in general.
-Confirmed working end-to-end before shipping: built the image locally,
-ran it with real credentials mounted and `ROON_HOST` set, from default
-bridge networking, and it connected to the actual Roon Core, read real
-zone state, and pushed a real `/clear` to the actual board - not just
-"the container starts without an exception."
-
-**Credentials aren't host-bound.** `roon_core_id.txt`/`roon_token.txt`
-identify this *application* as approved in Roon's Settings > Extensions,
-not the machine that ran `pair.py` - they can be copied to the deploy
-target directly (which is what `deploy.sh` does) rather than re-pairing
-there, which would need a fresh "Enable" click in Roon anyway since
-`pair.py` itself still needs LAN multicast to work (it wasn't updated
-with the same `--roon-host` bypass - it's meant to be run locally, once,
-where discovery already works, not inside the container).
-
-**`compose.yaml` has no `build:` section at all**, deliberately - the
-image is always built locally (`docker buildx build --platform
-linux/amd64 ... --load`) and shipped to the remote host as a tarball
-(`docker save` / `docker load`), referenced purely by tag
-(`image: roonalbumdisplay:latest`). An earlier version kept a `build:`
-stanza pointing at `roon_client/` "just in case", which meant
-`deploy.sh` had to also copy that whole directory to the remote so
-`docker compose` could even parse the file (it expects a `build:`
-context to exist even when nothing is actually rebuilt) - removing
-`build:` entirely was simpler than working around it, and matches how
-the reference `discogs` deploy script on the same host does it too:
-build once locally, ship a tarball, reference by tag only.
-
-**`ENV PYTHONUNBUFFERED=1` is set in the Dockerfile itself**, not left
-for whoever runs the container to remember - this is the exact same
-stdout-buffering pitfall noted below (Python's stdout is block-buffered
-off a TTY), and `docker logs` showing nothing is a particularly
-confusing way to rediscover it.
 - **Album art path**: `RoonApi.get_image(image_key, scale='fit', width=64,
   height=64)` returns a URL to Roon Core's *own* `/api/image/<key>`
   endpoint — Core does the fetching/resizing/caching, the extension just
@@ -390,6 +329,123 @@ confusing way to rediscover it.
   intermediate precision (e.g. via numpy) to be safe on real-world dark
   images** - the 8-bit `point()`-LUT shortcut that made it "free" to add
   is exactly what makes it unsafe.
+
+### Docker deployment
+
+`roon_client/Dockerfile` + `compose.yaml` + `deploy.sh` run the daemon as
+a container on another LAN machine (a Linux box running
+[Dockge](https://github.com/louislam/dockge)) instead of ad hoc on a Mac,
+with `restart: unless-stopped` giving auto-restart-on-crash and
+auto-start-on-boot for free (the persistent-supervisor gap noted below,
+solved a different way than the LaunchAgent that was asked about and
+declined earlier). `deploy.sh` borrows its structure and style (variable
+layout, echo messages, heredoc'd single-SSH-call remote step) from a
+working deploy script for another container ("discogs") on the same host,
+but its remote half differs on purpose - see the next section.
+
+**The deployment has three separate places, and a `./` path points at
+the wrong one.** This cost a wrong turn and is worth spelling out:
+
+- Dockge runs *inside a container* on the Docker host, and the
+  `/opt/stacks` it shows is NAS-backed (that's where a stack's
+  `compose.yml` lives).
+- The Docker *daemon* that actually starts containers is on the host. So a
+  relative bind-mount like `./roon_token.txt` in a stack's compose file is
+  resolved by the daemon against the **host's local disk**, at
+  `/opt/stacks/<name>/` - a directory that merely shares a name with the
+  NAS-backed folder Dockge shows, and is a different directory with
+  different contents.
+- The first version of `deploy.sh` `scp`'d `compose.yaml` and the two
+  credential files into the host's `/opt/stacks/roonalbumdisplay/` and ran
+  `docker compose up -d` there. The container did start - but from a
+  second, host-local copy of the stack, parallel to the Dockge-managed
+  one. Re-running that script would very likely also have overwritten it and
+  recreated the container from the old `./` paths (same project name),
+  undoing the fix - reasoned from the config, not tested.
+  (An earlier version of this section claimed the host path and Dockge's
+  folder were the same storage; that was a misreading - the directory
+  timestamps differed, 20:43 on the host vs 20:56 in Dockge's view.)
+
+Current layout:
+
+- **Credentials** live on the NAS at `/volume1/docker/discogs/roonalbumdisplay/`
+  and are mounted by a named volume in `compose.yaml` (`driver: local`,
+  `type: nfs`, `device: ":/volume1/docker/discogs/roonalbumdisplay"`, one
+  `subpath:` mount per file). After re-pairing, run `./deploy.sh --creds`
+  to put the new files there and force-recreate the container; a plain
+  `./deploy.sh` leaves them alone.
+- **`deploy.sh` writes them through the SSH shell** (`ssh nas "cat >
+  path" < file`), not `scp`: Synology's SFTP presents a different path
+  root than the shell (`/docker/...` vs `/volume1/docker/...`, and `/tmp`
+  isn't visible at all), and `scp` uses SFTP. The shell path is also the
+  exact string in the compose file's NFS `device:`, so there's one path
+  to keep in sync, not two.
+- **The compose file** is managed in Dockge (its copy is `compose.yml`
+  there; the repo's `compose.yaml` is a mirror, verified to resolve to an
+  identical config). `deploy.sh` does not push it. Change it in Dockge,
+  then update the mirror by hand.
+- **Restart** goes through Dockge's own container:
+  `docker exec dockge-dockge-agent-1 sh -c "cd /opt/stacks/roonalbumdisplay
+  && docker compose up -d"` - the way Dockge itself runs compose (inside its
+  container, against the NAS-backed stack folder). Verified against the live stack (reports the
+  container `Running`, no changes, when no new image has been loaded).
+  `docker compose up -d` recreates the container when the tag now points
+  at a different image ID, which is how a code change gets picked up.
+- The image tarball lands in `/tmp` on the host, not in a stack folder.
+- **Cleaned up (2026-10-06):** the old host-local
+  `/opt/stacks/roonalbumdisplay/` on the Docker host (a stale
+  `compose.yaml` plus a copy of the Roon token) has been deleted. After
+  removal the container kept running untouched and Dockge's own view of the
+  stack was intact, which confirms nothing depended on it. If that folder
+  ever reappears, something is writing into the host's `/opt/stacks`
+  instead of going through Dockge.
+
+**The one thing that actually matters for networking**: `RoonDiscovery`
+uses UDP multicast broadcast (SOOD, port 9003) to find the Core, and that
+does not cross into a container's default bridge network - a naive
+dockerization would silently fail to find Roon at all. `--roon-host`/
+`ROON_HOST` (added specifically for this) bypasses discovery and connects
+directly to a known IP - a plain outbound TCP connection, which works
+fine from default bridge networking on *any* Docker host. The
+alternative, `--network host` (or `network_mode: host`), would keep
+zero-config discovery working, but **only on Linux Docker hosts** -
+Docker Desktop on Mac/Windows runs containers in a VM and doesn't expose
+true host networking, so that option was rejected as not portable enough
+for "deploy this to some other machine on the LAN" in general. Confirmed
+working end-to-end before shipping: built the image locally, ran it with
+real credentials mounted and `ROON_HOST` set, from default bridge
+networking, and it connected to the actual Roon Core, read real zone
+state, and pushed a real `/clear` to the actual board - not just "the
+container starts without an exception."
+
+**Credentials aren't host-bound.** `roon_core_id.txt`/`roon_token.txt`
+identify this *application* as approved in Roon's Settings > Extensions,
+not the machine that ran `pair.py` - so they only need to exist on the
+NAS, not be re-created per machine. Re-pairing still needs a fresh
+"Enable" click in Roon, and `pair.py` itself still needs LAN multicast
+to work (it wasn't given the `--roon-host` bypass - it's meant to be run
+locally, once, where discovery already works, not inside the container).
+The flow after a new pairing: `uv run roon_client/pair.py`, then
+`./deploy.sh --creds`.
+
+**`compose.yaml` has no `build:` section at all**, deliberately - the
+image is always built locally (`docker buildx build --platform
+linux/amd64 ... --load`) and shipped to the remote host as a tarball
+(`docker save` / `docker load`), referenced purely by tag
+(`image: roonalbumdisplay:latest`). An earlier version kept a `build:`
+stanza pointing at `roon_client/` "just in case", which meant
+`deploy.sh` had to also copy that whole directory to the remote so
+`docker compose` could even parse the file (it expects a `build:`
+context to exist even when nothing is actually rebuilt) - removing
+`build:` entirely was simpler than working around it, and matches how
+the reference `discogs` deploy script on the same host does it too:
+build once locally, ship a tarball, reference by tag only.
+
+**`ENV PYTHONUNBUFFERED=1` is set in the Dockerfile itself**, not left
+for whoever runs the container to remember - this is the exact same
+stdout-buffering pitfall noted below (Python's stdout is block-buffered
+off a TTY), and `docker logs` showing nothing is a particularly
+confusing way to rediscover it.
 
 ### Zone-selection logic (rewritten three times — read this before touching it again)
 

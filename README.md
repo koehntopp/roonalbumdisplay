@@ -202,29 +202,36 @@ any Docker host (unlike `--network host`, which only works properly on
 Linux Docker hosts, not Docker Desktop on Mac/Windows). If your Roon
 Core's LAN IP might change, give it a DHCP reservation in your router.
 
-`deploy.sh` targets a [Dockge](https://github.com/louislam/dockge) stack
-directory (`/opt/stacks/<name>/`) on the remote host — adjust `REMOTE_DIR`
-if you're not using Dockge; any directory `docker compose` can run from
-works the same way.
+`deploy.sh` builds the image locally, ships it to the Docker host, and
+recreates the stack there through the [Dockge](https://github.com/louislam/dockge)
+container. It deliberately does **not** push a compose file: the stack is
+managed in Dockge, and `compose.yaml` here is a mirror of it for reference.
+
+**Where the Roon pairing files go matters.** Dockge runs compose through
+the *host's* Docker daemon, so a relative `./roon_token.txt` bind mount in
+a stack resolves on the host's local disk — not in the NAS-backed stacks
+folder you see in Dockge. `compose.yaml` therefore mounts them from an NFS
+volume on the NAS instead (`/volume1/docker/discogs/roonalbumdisplay`), and
+`deploy.sh --creds` is what writes them there. See AGENTS.md ("Docker
+deployment") for the full story.
 
 1. Pair locally first if you haven't already (`uv run roon_client/pair.py`
    — see above). The resulting `roon_client/roon_core_id.txt` and
    `roon_token.txt` aren't tied to a specific machine, just to this app's
-   identity as approved in Roon, so they can be copied to the deploy
-   target rather than re-paired there.
-2. Edit `compose.yaml`'s `ROON_HOST` and `PANEL_URL` to match your setup.
-3. Edit `deploy.sh`'s `REMOTE_USER`/`REMOTE_HOST`/`REMOTE_DIR` for your
-   target machine. It builds the image locally for `linux/amd64` (adjust
-   if your server is arm64, e.g. a Raspberry Pi), copies it and the
-   compose file/credentials over SSH, and runs `docker compose up -d`
-   there. The target machine needs Docker already installed — the script
-   doesn't install it.
-4. Run `./deploy.sh`. Check on it afterward with:
+   identity as approved in Roon.
+2. Create the stack in Dockge from `compose.yaml`, adjusting `ROON_HOST`,
+   `PANEL_URL`, and the NFS `addr`/`device` for your NAS.
+3. Edit `deploy.sh`'s configuration block (`REMOTE_USER`, `REMOTE_HOST`,
+   `NAS_HOST`, `NAS_CREDS_DIR`, ...). It builds for `linux/amd64` (adjust
+   if your server is arm64, e.g. a Raspberry Pi). The Docker host needs
+   Docker already installed — the script doesn't install it.
+4. First deploy, and any time you re-pair Roon: `./deploy.sh --creds`
+   (pushes the pairing files to the NAS, then force-recreates the
+   container so it re-reads them). For code changes: `./deploy.sh`.
+5. Check on it afterward with:
    ```bash
-   ssh youruser@yourhost 'cd /opt/stacks/roonalbumdisplay && docker compose logs -f'
+   ssh youruser@yourhost 'docker logs -f roonalbumdisplay-roon-display-1'
    ```
-
-To redeploy after any code change, just run `./deploy.sh` again.
 
 ## Board HTTP API reference
 

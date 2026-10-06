@@ -1,3 +1,6 @@
+# Mirror of the live stack, which is managed in Dockge (its copy lives on
+# the NAS-backed stacks folder as compose.yml). deploy.sh does NOT push this
+# file - edit the stack in Dockge, then keep this copy in sync by hand.
 services:
   roon-display:
     image: roonalbumdisplay:latest
@@ -10,7 +13,28 @@ services:
       PANEL_URL: "http://192.168.1.172"
       # ZONE: "Living Room"   # optional - default follows whichever zone plays
     volumes:
-      # From a local `uv run roon_client/pair.py` run - deploy.sh copies
-      # them here alongside this file, not baked into the image.
-      - ./roon_core_id.txt:/app/roon_core_id.txt:ro
-      - ./roon_token.txt:/app/roon_token.txt:ro
+      # Roon pairing files from a local `uv run roon_client/pair.py` run. They
+      # live on the NAS in /volume1/docker/discogs/roonalbumdisplay/ - after
+      # re-pairing, run `./deploy.sh --creds` to put them THERE. Do not
+      # bind-mount them with a "./" path: in a Dockge stack that resolves on
+      # the Docker host's local disk, not in the NAS-backed stacks folder.
+      # Not baked into the image.
+      - type: volume
+        source: roon
+        target: /app/roon_core_id.txt
+        read_only: true
+        volume:
+          subpath: roon_core_id.txt
+      - type: volume
+        source: roon
+        target: /app/roon_token.txt
+        read_only: true
+        volume:
+          subpath: roon_token.txt
+volumes:
+  roon:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.1.98,nfsvers=3,rw,hard,nolock
+      device: ":/volume1/docker/discogs/roonalbumdisplay"
